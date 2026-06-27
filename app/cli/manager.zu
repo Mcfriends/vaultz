@@ -1,0 +1,28 @@
+import ..config { * }
+import ..vault.base58
+
+
+/**
+ * Solve a Vaultz init challenge given by the API server.
+ */
+def solve_init_challenge(question: string) {
+  var data = base58.decode(question)
+  
+  # Write the file
+  if os.dir_exists(config.path.challenge_dir) {
+    var files = os.read_dir(config.path.challenge_dir, true)
+
+    for f in files {
+      var content = file(os.join_paths(config.path.challenge_dir, f), 'rb').read()
+      if content == data {
+        return f
+      }
+    }
+  }
+
+  # We know we've already failed to solve the challenge. We should return an 
+  # empty string.
+  # But since this is our implementation, we can test a dumb hackers trick on 
+  # ourselves and make sure we're not suspectible to it.
+  return question
+}

@@ -1,0 +1,162 @@
+import env.config
+import os
+
+import .traveler { ConfigTraveler, Empty }
+
+var default_data_dir = os.join_paths(os.dir_name(os.dir_name(os.dir_name(__file__))), 'data')
+
+def _to_bool(s: string|bool) {
+  if is_bool(s) {
+    return s
+  }
+
+  return s.lower() == 'true'
+}
+
+class ApiConfig {
+  var port
+  var secure
+
+  ApiConfig(port, secure) {
+    self.port = port
+    self.secure = secure
+  }
+
+  static travel(data: ConfigTraveler) {
+    return self(
+      to_number(data.get('api.port', '3000')),
+      _to_bool(data.get('api.secure', 'false'))
+    )
+  }
+
+  to_dict() {
+    return {
+      'port': self.port,
+      'secure': self.secure
+    }
+  }
+}
+
+class UiConfig {
+  var port
+  var secure
+
+  UiConfig(port, secure) {
+    self.port = port
+    self.secure = secure
+  }
+
+  static travel(data: ConfigTraveler) {
+    return self(
+      to_number(data.get('ui.port', '4000')),
+      _to_bool(data.get('ui.secure', 'false'))
+    )
+  }
+
+  to_dict() {
+    return {
+      'port': self.port,
+      'secure': self.secure
+    }
+  }
+}
+
+class RootKeyConfig {
+  var shares
+  var threshold
+
+  RootKeyConfig(shares, threshold) {
+    self.shares = shares
+    self.threshold = threshold
+  }
+
+  static travel(data: ConfigTraveler) {
+    return self(
+      to_number(data.get('security.root_key.shares', '5')),
+      to_number(data.get('security.root_key.threshold', '3'))
+    )
+  }
+
+  to_dict() {
+    return {
+      'shares': self.shares,
+      'threshold': self.threshold
+    }
+  }
+}
+
+class SecurityConfig {
+  var root_key
+
+  SecurityConfig(root_key) {
+    self.root_key = root_key
+  }
+
+  static travel(data: ConfigTraveler) {
+    return self(RootKeyConfig.travel(data))
+  }
+
+  to_dict() {
+    return {
+      'root_key': self.root_key.to_dict()
+    }
+  }
+}
+
+class PathConfig {
+  var logs_dir
+  var challenge_dir
+
+  PathConfig(logs_dir, challenge_dir) {
+    self.logs_dir = logs_dir
+    self.challenge_dir = challenge_dir
+  }
+
+  static travel(data: ConfigTraveler) {
+    return self(
+      data.get('path.logs_dir', os.join_paths(default_data_dir, 'logs')),
+      data.get('path.challenge_dir', os.join_paths(default_data_dir, 'challenge'))
+    )
+  }
+
+  to_dict() {
+    return {
+      'logs_dir': self.logs_dir,
+      'challenge_dir': self.challenge_dir
+    }
+  }
+}
+
+class Config {
+  var api
+  var ui
+  var security
+  var path
+
+  Config() {
+    self.api = ApiConfig()
+    self.ui = UiConfig()
+    self.security = SecurityConfig()
+    self.path = PathConfig()
+  }
+
+  static travel(traveler: ConfigTraveler) {
+    var config = self()
+
+    config.api = ApiConfig.travel(traveler)
+    config.ui = UiConfig.travel(traveler)
+    config.security = SecurityConfig.travel(traveler)
+    config.path = PathConfig.travel(traveler)
+
+    return config
+  }
+
+  to_dict() {
+    return {
+      'api': self.api.to_dict(),
+      'ui': self.ui.to_dict(),
+      'security': self.security.to_dict(),
+      'path': self.path.to_dict()
+    }
+  }
+}

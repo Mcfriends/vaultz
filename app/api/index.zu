@@ -1,0 +1,15 @@
+import http
+import log
+
+import .routes
+
+def run_server() {
+  var port = to_number(config.api.port)
+  
+  var server = http.server(port)
+
+  routes(server)
+  
+  log.info('Starting API server on port ${port}...')
+  server.listen()
+}

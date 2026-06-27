@@ -1,0 +1,66 @@
+/**
+ * The config traveler class is used to traverse the config tree 
+ * and get values.
+ */
+
+class ConfigTraveler {
+  ConfigTraveler(user: ?dict, original: ?dict) {
+    if user == nil {
+      user = {}
+    } else {
+      user = user.compact()
+    }
+
+    if original == nil {
+      original = {}
+    } else {
+      original = original.compact()
+    }
+
+    self.user = user
+    self.original = original
+  }
+
+  get(key: string, default_value: ?any) {
+    var key_split = key.split('.')
+
+    var config = self.user
+    var original = self.original
+    
+    for k in key_split {
+      config = config.get(k, nil)
+
+      if config == nil and is_dict(original) {
+        config = original.get(k, nil)
+        original = config
+      }
+      
+      if config == nil {
+        break
+      }
+
+      if is_dict(original) {
+        original = original.get(k, nil)
+      }
+    }
+
+    var final_value = config
+    
+    if config == nil and default_value != nil {
+      final_value = default_value
+    }
+
+    return is_dict(final_value) ? 
+      ConfigTraveler(final_value) : 
+      final_value
+  }
+
+  to_dict() {
+    var dict = self.original.compact()
+    dict.extend(self.user.compact())
+    return dict
+  }
+}
+
+var Empty = ConfigTraveler()
+

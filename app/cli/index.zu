@@ -1,0 +1,52 @@
+import args
+
+var cli = args.Parser('vaultz')
+
+cli.add_command(
+  'init',
+  'Initializes the vault'
+)
+
+cli.add_command(
+  'seal',
+  'Seals the vault'
+)
+
+cli.add_command(
+  'unseal',
+  'Unseals the vault'
+)
+
+cli.add_command(
+  'login',
+  'Logs in to the vault'
+)
+
+cli.add_command(
+  'add',
+  'Adds data to the vault'
+).add_option(
+  'key',
+  'The key to use for encryption',
+  {
+    type: args.STRING,
+    required: true,
+  }
+).add_option(
+  'data',
+  'The data to add',
+  {
+    type: args.STRING,
+    required: true,
+  }
+)
+
+cli.add_command(
+  'get',
+  'Gets data from the vault',
+  {
+    type: args.STRING
+  }
+)
+
+cli.parse()

@@ -1,0 +1,9 @@
+import log
+import date
+
+var time = date.localtime()
+log.add_transport(log.FileTransport(
+  '${config.path.logs_dir}/${time.year}-${to_string(time.month).lpad(2,'0')}-${to_string(time.day).lpad(2,'0')}.log'
+))
+
+# log.default_transport().disable()

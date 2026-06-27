@@ -1,0 +1,61 @@
+import json
+
+import ..vault.manager
+
+# var 
+
+def _authorize(req, res) {
+  var auth_key = req.headers.get('Authorization', '').split('Bearer ').last()
+  
+  if !auth_key {
+    res.json({
+      error: 'Unauthorized',
+    }, 401)
+    return false
+  }
+
+  # Verify the auth key
+  if !manager.verify_auth_key(auth_key) {
+    res.json({
+      error: 'Unauthorized',
+    }, 401)
+
+    return false
+  }
+
+  return true
+}
+
+def init(req, res) {
+  res.write(json.encode(req))
+}
+
+def seal(req, res) {
+  if _authorize(req, res) {
+    res.write(json.encode(req))
+  }
+}
+
+def unseal(req, res) {
+  if _authorize(req, res) {
+    res.write(json.encode(req))
+  }
+}
+
+def login(req, res) {
+  if _authorize(req, res) {
+    res.write(json.encode(req))
+  }
+}
+
+def add(req, res) {
+  if _authorize(req, res) {
+    res.write(json.encode(req))
+  }
+}
+
+def get(req, res) {
+  if _authorize(req, res) {
+    res.write(json.encode(req))
+  }
+}

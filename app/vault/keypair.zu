@@ -1,0 +1,340 @@
+/**
+ * Generates a Vaultz ed25519 keypair
+ *
+ * Vaultz keypairs are plain ed25519 keypairs:
+ *
+ *   - The "address" / public key is the base58 encoding of the raw
+ *     32-byte ed25519 public key.
+ *   - The "private key" shared with Vaultz administrators are base58
+ *     (or raw JSON byte array) encoding of the 64-byte concatenation
+ *     `seed(32 bytes) || public_key(32 bytes)`.
+ *
+ * IMPORTANT — what this file does and does NOT do:
+ *
+ *   - It does NOT implement ed25519, EdDSA, SHA-512, or any elliptic
+ *     curve math. All real cryptographic work (key generation, the
+ *     CSPRNG, signing, verification) is delegated to Zuri's `crypto`
+ *     module (`crypto.ed25519`).
+ *   - It DOES implement a small amount of fixed-offset DER slicing to 
+ *     translate the PEM keys `crypto.ed25519.generate()` returns into 
+ *     the raw-byte format.
+ *
+ * Why the DER slicing is safe without a full ASN.1 parser:
+ *
+ *   ed25519 keys carry no algorithm parameters (RFC 8410), so both the
+ *   PKCS#8 private-key DER and the SPKI public-key DER for an ed25519
+ *   key are fixed-length byte strings:
+ *
+ *     PKCS#8 private key (48 bytes total):
+ *       30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20 <32-byte seed>
+ *
+ *     SPKI public key (44 bytes total):
+ *       30 2a 30 05 06 03 2b 65 70 03 21 00 <32-byte public key>
+ *
+ *   In both cases the raw key material is exactly the last 32 bytes,
+ *   so slicing is both correct and verifiable by inspection — no
+ *   general-purpose ASN.1 decoder required.
+ */
+
+import crypto
+import base64
+import json
+import io
+import os
+
+import .base58
+
+# ---------------------------------------------------------------------------
+# PEM → raw ed25519 key bytes
+# ---------------------------------------------------------------------------
+
+/**
+ * Strips PEM armor (`-----BEGIN ...-----` / `-----END ...-----`) and
+ * whitespace/newlines, returning the base64 payload only.
+ *
+ * @param  string pem
+ * @return string
+ */
+def _pem_payload(pem) {
+  var payload = ''
+  for line in pem.split('\n') {
+    line = line.trim()
+    if line.length() == 0 or line.starts_with('-----') {
+      continue
+    }
+    payload += line
+  }
+  return payload
+}
+
+/**
+ * Returns the final `n` bytes of a bytes object.
+ *
+ * @param  bytes  data
+ * @param  number n
+ * @return bytes
+ */
+def _last_bytes(data, n) {
+  return data[data.length() - n,]
+}
+
+/**
+ * Extracts the raw 32-byte ed25519 key material from a PKCS#8 private
+ * key PEM or an SPKI public key PEM (see module doc comment above for
+ * why slicing the final 32 bytes is correct for ed25519 specifically).
+ *
+ * @param  string pem
+ * @return bytes  exactly 32 bytes
+ * @throws Exception on malformed input
+ */
+def _raw_ed25519_key(pem) {
+  var der = base64.decode(_pem_payload(pem))
+
+  if der.length() < 32 {
+    raise Exception('Malformed ed25519 PEM: decoded DER is too short')
+  }
+
+  return der[der.length() - 32,]
+  # return _last_bytes(der, 32)
+}
+
+
+# ---------------------------------------------------------------------------
+# Keypair generation
+# ---------------------------------------------------------------------------
+
+/**
+ * Generates a fresh ed25519 keypair.
+ *
+ * @return dict {
+ *   address:           string  base58 public key
+ *   private_key_base58: string  base58 of the 64-byte private key
+ *   private_key_bytes:  bytes   raw 64-byte private key (seed || pubkey)
+ * }
+ * @throws Exception if key generation or the self-check fails
+ */
+def generate() {
+  var kp
+
+  catch {
+    kp = crypto.ed25519.generate()
+  } as e {
+    raise Exception('ed25519 key generation failed: ' + e.message)
+  }
+
+  var seed   = _raw_ed25519_key(kp.private_pem)   # 32-byte seed
+  var pubkey = _raw_ed25519_key(kp.public_pem)    # 32-byte public key
+
+  if seed.length() != 32 or pubkey.length() != 32 {
+    raise Exception('Unexpected ed25519 key length after PEM extraction')
+  }
+
+  # Private-key convention is the 64-byte concatenation of the seed 
+  # and the public key.
+  var private_key_64 = seed + pubkey
+
+  return {
+    address:           base58.encode(pubkey),
+    private_key_base58: base58.encode(private_key_64),
+    private_key_bytes:  private_key_64,
+  }
+}
+
+/**
+ * Decodes a base58 string a user gave you as either a public key or a
+ * private key, and tells you which it was based on length.
+ *
+ * Note: base58 here is an *encoding*, not encryption — there is nothing
+ * to decrypt. This just turns the text back into the raw bytes Zuri's
+ * `crypto.ed25519` functions expect.
+ *
+ * @param  string str
+ * @return dict {
+ *   kind:        string  'public_key' (32 bytes) or 'private_key' (64 bytes)
+ *   bytes:       bytes   the full decoded byte string
+ *   seed:        ?bytes  32-byte seed, only present when kind == 'private_key'
+ *   public_key:  ?bytes  32-byte public key, present in both cases —
+ *                        for a private_key this is read straight out of
+ *                        the trailing 32 bytes (no curve math needed,
+ *                        see note below), for a public_key it's `bytes`
+ *                        itself
+ * }
+ * @throws Exception if the decoded length is neither 32 nor 64 bytes
+ */
+def decode_key(str) {
+  var raw = base58.decode(str)
+
+  if raw.length() == 32 {
+    return { 
+      kind: 'public', 
+      bytes: raw, 
+      seed: nil, 
+      public_key: raw,
+    }
+  }
+
+  if raw.length() == 64 {
+    # Private-key convention is seed(32) || public_key(32) — so the
+    # public key is already embedded; no curve math is required to read
+    # it back out here. This is different from deriving a public key
+    # from *only* the 32-byte seed — see the note on
+    # public_key_from_private_key further down for why that case is
+    # handled differently.
+    var seed = raw[0, 32]
+    var pub  = raw[32, 64]
+
+    return { 
+      kind: 'private', 
+      bytes: raw, 
+      seed: seed, 
+      public_key: pub,
+    }
+  }
+
+  raise Exception(
+    'decode_key: expected 32 bytes (public key) or 64 bytes (private ' +
+    'key) after base58 decoding, got ${raw.length()} bytes'
+  )
+}
+
+/**
+ * Recovers the 32-byte ed25519 public key from a key a user gave you.
+ *
+ * Accepts either a base58 string or raw `bytes`, and handles the two
+ * shapes you'll actually see in the wild:
+ *
+ *   - 64 bytes (Private-key convention is seed(32) || public_key(32)) 
+ *     — the public key is already sitting in the trailing 32 bytes. 
+ *     No math involved, just reads it back out.
+ *   - 32 bytes — this is *only* the seed, with the public key nowhere
+ *     in it. Recovering the public key from a bare seed requires the
+ *     actual ed25519 derivation (SHA-512 the seed, clamp it, multiply
+ *     the curve's base point by the resulting scalar). That's real
+ *     elliptic-curve cryptography, and hand-writing it here — instead
+ *     of using an audited implementation — is exactly the kind of thing
+ *     that produces subtly-wrong or side-channel-leaky keys without
+ *     ever throwing an error. This function deliberately refuses that
+ *     case rather than guess.
+ *
+ * @param  bytes|string key  base58 string or raw bytes
+ * @return bytes             32-byte ed25519 public key
+ * @throws Exception         on a 32-byte (bare seed) input, or any
+ *                            length other than 32 or 64 bytes
+ */
+def public_key_from_private_key(key, encoded) {
+  var raw = is_string(key) ? base58.decode(key) : key
+
+  if raw.length() == 64 {
+    var public_key = raw[32, 64]
+
+    if !encoded {
+      return public_key
+    }
+
+    return base58.encode(public_key)
+  }
+
+  if raw.length() == 32 {
+    raise Exception(
+      'public_key_from_private_key: got a 32-byte value, which is just ' +
+      'the ed25519 seed — it does not contain the public key, and ' +
+      'deriving one from it requires real ed25519 scalar multiplication ' +
+      'that this module does not implement (see the doc comment above).'
+    )
+  }
+
+  raise Exception(
+    'public_key_from_private_key: expected 32 or 64 bytes, got ${raw.length()}'
+  )
+}
+
+/**
+ * Recovers the 32-byte ed25519 encryption key from a key a user gave you.
+ *
+ * Accepts either a base58 string or raw `bytes`, and handles the two
+ * shapes you'll actually see in the wild:
+ *
+ *   - 64 bytes (Private-key convention is encryption_key(32) || public_key(32)) 
+ *     — the encryption key is already sitting in the starting 32 bytes. 
+ *     No math involved, just reads it back out.
+ *
+ * @param  bytes|string key  base58 string or raw bytes
+ * @return bytes             32-byte ed25519 encryption key
+ * @throws Exception         on a 32-byte (bare seed) input, or any
+ *                            length other than 32 or 64 bytes
+ */
+def encryption_key_from_private_key(key, encoded) {
+  var raw = is_string(key) ? base58.decode(key) : key
+
+  if raw.length() == 64 {
+    var encryption_key = raw[0, 32]
+
+    if !encoded {
+      return encryption_key
+    }
+
+    return base58.encode(encryption_key)
+  }
+
+  if raw.length() == 32 {
+    # We'll assume its the encryption key itself.
+    return raw
+  }
+
+  raise Exception(
+    'encryption_key_from_private_key: expected 32 or 64 bytes, got ${raw.length()}'
+  )
+}
+
+
+# ---------------------------------------------------------------------------
+# JSON keyfile
+# ---------------------------------------------------------------------------
+
+/**
+ * Writes a keyfile in JSON array of the 64 raw private-key bytes.
+ *
+ * @param bytes  private_key_bytes  the 64-byte private key
+ * @param string path              output file path
+ */
+def write_keyfile(private_key_bytes, path) {
+  var arr = []
+  for b in private_key_bytes {
+    arr.append(b)
+  }
+
+  var f = file(path, 'w')
+  f.write(json.encode(arr))
+  f.close()
+}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __root__ == __file__ {
+  var keyfile_path = 'id.json'
+
+  catch {
+    var kp = generate()
+
+    echo 'Address (public key):'
+    echo kp.address
+    echo ''
+    echo 'Private key (base58 — keep this private; never commit or share it):'
+    echo kp.private_key_base58
+    echo ''
+
+    if io.readline('Write keyfile? (y/n):').lower() == 'y' {
+      write_keyfile(kp.private_key_bytes, keyfile_path)
+      echo 'Wrote a JSON keyfile to ${keyfile_path}'
+    }
+
+    echo 'Validation:'
+    echo public_key_from_private_key(kp.private_key_base58, true)
+  } as e {
+    io.stderr.write('Error generating keypair: ${e.message}\n')
+    os.exit(1)
+  }
+}

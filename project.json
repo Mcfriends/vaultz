@@ -1,0 +1,23 @@
+{
+  "name": "vaultz", 
+  "version": "1.0.0", 
+  "description": "A highly secure key-value storage for sensitive data, passwords, and tokens with UI, CLI, and JSON-RPC access.", 
+  "homepage": "", 
+  "tags": [
+    "storage", 
+    "database", 
+    "security", 
+    "storage", 
+    "key-value", 
+    "token-management", 
+    "password-management"
+  ], 
+  "author": "Richard Ore <eqliqandfriends@gmail.com>", 
+  "license": "MIT", 
+  "sources": [
+    "https://pub.zurilang.org"
+  ], 
+  "deps": {}, 
+  "cvs_deps": {}, 
+  "bundle": {}
+}

@@ -1,0 +1,82 @@
+import os
+import log
+import yaml
+import reflect
+
+import .config { Config }
+import .traveler { ConfigTraveler }
+
+
+var _default_config_file = os.join_paths(
+  os.dir_name(__root__), 
+  'default.yaml'
+)
+
+def get_config_file() {
+  var config_file = os.get_env(
+    'VAULT_CONFIG_FILE', 
+    os.join_paths(
+      os.home_dir(), 
+      'vaultz.yaml'
+    )
+  )
+
+  if !config_file {
+    log.error('Invalid config file path: ${config_file}')
+    os.exit(1)
+  }
+  
+  if !file(config_file).exists() {
+    # Default to the built-in configuration file.
+    config_file = _default_config_file
+  }
+
+  return config_file
+}
+
+def load_default_config() {
+  if !file(_default_config_file).exists() {
+    log.warn('Could not find default config file ${_default_config_file}')
+    return {}
+  }
+
+  return yaml.load_file(_default_config_file).first()
+}
+
+def load_config() {
+
+  var config_file = get_config_file()
+  log.info('Config file: ${config_file}')
+
+  var default_config = load_default_config()
+
+  if !file(config_file).exists() {
+    log.warn('Could not find config file ${config_file}')
+    return Config.travel(ConfigTraveler(default_config))
+  }
+
+  return Config.travel(
+    ConfigTraveler(
+      yaml.load_file(config_file).first(),
+      default_config
+    )
+  )
+}
+
+
+# # Singleton instance
+# var _config_singleton = nil
+
+# def config() {
+#   if !_config_singleton {
+#     _config_singleton = load_config()
+#   }
+
+#   return _config_singleton
+# }
+
+/**
+ * This is the exported shorthand!
+ */
+# var c = config()
+reflect.set_global(load_config(), 'config')

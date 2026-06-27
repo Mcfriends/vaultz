@@ -1,0 +1,673 @@
+/**
+ * Shamir's Secret Sharing (SSS) over GF(256), designed for a vault /
+ * secret-management service.
+ *
+ * ## Design
+ *
+ * This splits a secret into `n` shares such that any `k` of them
+ * reconstruct it exactly, while any `k - 1` reveal nothing about it
+ * (information-theoretically, not just computationally).
+ *
+ * It operates byte-by-byte over GF(256) — the same design HashiCorp
+ * Vault uses for its operator-unseal shares, and the same one used by
+ * SLIP-039 and most other production SSS implementations. Two
+ * consequences of that choice that matter here:
+ *
+ *   - **No `bigint` needed.** Every value in GF(256) fits in a single
+ *     byte, so all arithmetic is plain integer ops + a 256-entry
+ *     log/exp table. There's no large-prime modulus to manage and no
+ *     risk of subtle bias from an improperly chosen prime — a real
+ *     failure mode in naive GF(p) Shamir implementations.
+ *   - **It's a small, exhaustively-specified algorithm**, not an
+ *     elliptic curve. The entire field (256 elements, generator 3,
+ *     reducing polynomial 0x11b — AES's field) is fixed and tiny enough
+ *     to validate by brute-force table inspection. That's a meaningfully
+ *     different risk profile than hand-rolling EdDSA scalar
+ *     multiplication, which is why this file implements the finite-field
+ *     math directly instead of refusing to, the way the Ed25519
+ *     "public key from bare seed" case did in `solana_keypair.zu`.
+ *
+ * All non-deterministic randomness (the polynomial coefficients that
+ * make shares secret) comes from `crypto.random_bytes`, Zuri's OS
+ * CSPRNG — never from `rand()` or any other non-cryptographic
+ * source.
+ *
+ * ## What this module does NOT give you
+ *
+ *   - **Secure memory erasure.** Zuri is garbage-collected; this module
+ *     cannot guarantee secret bytes are wiped from memory after use the
+ *     way a `memset_s` in C could attempt to. Don't treat process memory
+ *     as a trust boundary for long-lived secrets.
+ *   - **Side-channel hardening.** Table lookups for GF(256) arithmetic
+ *     are not guaranteed constant-time at the interpreter level. For a
+ *     vault unseal/recovery flow (infrequent, operator-driven, not an
+ *     attacker-timed oracle) this is an acceptable, standard trade-off —
+ *     the same one Vault itself makes. It would not be acceptable for,
+ *     say, a per-request decryption primitive.
+ *   - **Distribution/custody policy.** This module cannot stop you from
+ *     handing all `n` shares to the same person, which defeats the
+ *     point. That's an operational control, not a code one.
+ *
+ * ## Quick usage
+ *
+ * ```zuri
+ * import shamir
+ *
+ * var secret = crypto.random_bytes(32)   # e.g. a vault master key
+ *
+ * var result = shamir.generate_shares(secret, 5, 3)   # 5 shares, need 3
+ * # result.shares       -> 5 base58 strings, hand one to each custodian
+ * # result.fingerprint  -> hex sha256(secret); store this, NOT the secret
+ *
+ * # ... later, with any 3 of the 5 shares ...
+ * var recovered = shamir.recover_secret(some_three_shares, result.fingerprint)
+ * ```
+ */
+
+import crypto
+import hash
+
+import .base58
+
+
+# ---------------------------------------------------------------------------
+# GF(256) finite-field arithmetic
+# ---------------------------------------------------------------------------
+#
+# Field: GF(2^8), reducing polynomial x^8 + x^4 + x^3 + x + 1 (0x11b),
+# generator g = 3. This is the same field AES uses, chosen for the same
+# reason: it's the most heavily scrutinized GF(256) construction there is.
+
+var _GF256_EXP = [0] * 256
+var _GF256_LOG = [0] * 256
+
+var _gx = 1
+iter var _i = 0; _i < 255; _i++ {
+  _GF256_EXP[_i] = _gx
+  _GF256_LOG[_gx] = _i
+  # multiply _gx by 3 in GF(256): xtime(_gx) XOR _gx
+  var _xtime = _gx << 1
+  if (_xtime & 0x100) != 0 {
+    _xtime = _xtime ^ 0x11b
+  }
+  _gx = _xtime ^ _gx
+}
+_GF256_EXP[255] = _GF256_EXP[0]   # table wraps cleanly past index 254
+
+/**
+ * Multiplies two GF(256) elements.
+ * @param  number a  0-255
+ * @param  number b  0-255
+ * @return number    0-255
+ */
+def _gf_mul(a, b) {
+  if a == 0 or b == 0 {
+    return 0
+  }
+  var sum = _GF256_LOG[a] + _GF256_LOG[b]
+  if sum >= 255 {
+    sum -= 255
+  }
+  return _GF256_EXP[sum]
+}
+
+/**
+ * Divides two GF(256) elements: a / b.
+ * @param  number a  0-255
+ * @param  number b  0-255, must not be 0
+ * @return number    0-255
+ * @throws Exception on division by zero
+ */
+def _gf_div(a, b) {
+  if b == 0 {
+    raise Exception('shamir: GF(256) division by zero')
+  }
+  if a == 0 {
+    return 0
+  }
+  var diff = _GF256_LOG[a] - _GF256_LOG[b]
+  if diff < 0 {
+    diff += 255
+  }
+  return _GF256_EXP[diff]
+}
+
+
+# ---------------------------------------------------------------------------
+# Small private helpers
+# ---------------------------------------------------------------------------
+
+/**
+ * Constant-time-ish byte equality check (no early exit on mismatch).
+ * Used for checksum/fingerprint comparisons.
+ */
+def _ct_eq(a, b) {
+  if a.length() != b.length() {
+    return false
+  }
+  var diff = 0
+  iter var i = 0; i < a.length(); i++ {
+    diff = diff | (a[i] ^ b[i])
+  }
+  return diff == 0
+}
+
+
+# ---------------------------------------------------------------------------
+# Share representation
+# ---------------------------------------------------------------------------
+
+var _SHARE_VERSION = 1
+var _SHARE_HEADER_LEN = 5    # version(1) + threshold(1) + x(1) + secret_len(2)
+var _SHARE_CHECKSUM_LEN = 4  # leading bytes of SHA-256 over the header+payload
+
+/**
+ * One share of a secret split with `split_secret`.
+ *
+ * `x` and `y` are the (x, y) point on the secret-sharing polynomial;
+ * `threshold` and `secret_len` are metadata carried alongside so a
+ * share is self-describing (you can validate a set of shares before
+ * attempting recovery, and `decode_share` can reject mismatched sets).
+ */
+class Share {
+  Share(x, threshold, secret_len, y) {
+    if x < 1 or x > 255 {
+      raise Exception('Share: x must be between 1 and 255')
+    }
+
+    self.x = x
+    self.threshold = threshold
+    self.secret_len = secret_len
+    self.y = y
+  }
+
+  /**
+   * Encodes this share as a base58 string safe to hand to a custodian
+   * or store in a database column.
+   *
+   * Wire format (before base58), all integers big-endian:
+   *
+   *   [0]        version            (currently always 1)
+   *   [1]        threshold (k)      (2-255)
+   *   [2]        x coordinate       (1-255)
+   *   [3:5]      secret length      (u16, 0-65535)
+   *   [5:5+L]    y bytes            (L = secret length)
+   *   [5+L:9+L]  checksum           (first 4 bytes of SHA-256 of [0:5+L])
+   *
+   * @return string
+   */
+  to_string() {
+    var body = [
+      _SHARE_VERSION,
+      self.threshold,
+      self.x,
+      (self.secret_len >> 8) & 0xff,
+      self.secret_len & 0xff,
+    ]
+
+    body.extend(self.y.to_list())
+
+    var digest = hash.sha256(bytes(body), true)
+    iter var i = 0; i < _SHARE_CHECKSUM_LEN; i++ {
+      body.append(digest[i])
+    }
+
+    return base58.encode(bytes(body))
+  }
+}
+
+/**
+ * Decodes a base58 share string into a `Share`, verifying its
+ * checksum. If passed a `Share` already, returns it unchanged (so
+ * every public function in this module can accept either form
+ * interchangeably).
+ *
+ * @param  string|Share input
+ * @return Share
+ * @throws Exception if the share is malformed, corrupted, or tampered
+ *                    with (checksum mismatch)
+ */
+def decode_share(input) {
+  if !is_string(input) {
+    return input
+  }
+
+  var raw = base58.decode(input)
+
+  var min_len = _SHARE_HEADER_LEN + 1 + _SHARE_CHECKSUM_LEN
+  if raw.length() < min_len {
+    raise Exception('decode_share: malformed share (too short)')
+  }
+
+  var version    = raw[0]
+  var threshold  = raw[1]
+  var x          = raw[2]
+  var secret_len = (raw[3] << 8) | raw[4]
+
+  if version != _SHARE_VERSION {
+    raise Exception('decode_share: unsupported share version ${version}')
+  }
+
+  if x == 0 {
+    raise Exception('decode_share: invalid share (x coordinate is 0)')
+  }
+
+  var payload_len = raw.length() - _SHARE_HEADER_LEN - _SHARE_CHECKSUM_LEN
+  if secret_len != payload_len {
+    raise Exception(
+      'decode_share: declared secret length (${secret_len}) does not ' +
+      'match payload size (${payload_len}) — share is malformed'
+    )
+  }
+
+  var body_len = _SHARE_HEADER_LEN + payload_len
+  var body     = raw[,body_len]
+  var y        = raw[_SHARE_HEADER_LEN, body_len]
+  var checksum = raw[body_len,]
+
+  var expected = hash.sha256(body, true)
+  var expected_prefix = expected[,_SHARE_CHECKSUM_LEN]
+
+  if !_ct_eq(checksum, expected_prefix) {
+    echo 'Checksum = ${checksum}, Expected = ${expected_prefix}'
+
+    raise Exception(
+      'decode_share: checksum mismatch — share is corrupted or has been tampered with'
+    )
+  }
+
+  return Share(x, threshold, secret_len, y)
+}
+
+/**
+ * Returns true if `input` decodes as a structurally valid, uncorrupted
+ * share, without raising. Useful for vault UIs validating user-pasted
+ * shares before attempting a real recovery.
+ *
+ * @param  string|Share input
+ * @return bool
+ */
+def verify_share(input) {
+  catch {
+    decode_share(input)
+    return true
+  }
+
+  return false
+}
+
+/**
+ * Returns a share's metadata (threshold, x coordinate, secret length)
+ * without needing any other shares — useful for displaying "share 2 of
+ * 5, needs 3 to recover" in a UI without ever touching share material.
+ *
+ * @param  string|Share input
+ * @return dict {x: number, threshold: number, secret_len: number}
+ */
+def share_metadata(input) {
+  var sh = decode_share(input)
+  return { 
+    x: sh.x, 
+    threshold: sh.threshold, 
+    secret_len: sh.secret_len,
+  }
+}
+
+
+# ---------------------------------------------------------------------------
+# Core: split / combine
+# ---------------------------------------------------------------------------
+
+/**
+ * Splits `secret_bytes` into `n` shares, any `k` of which reconstruct
+ * it.
+ *
+ * @param  bytes  secret_bytes  non-empty, max 65535 bytes
+ * @param  number n             total shares, 2-255
+ * @param  number k             threshold to recover, 2-n
+ * @return list<Share>
+ * @throws Exception on invalid arguments
+ */
+def split_secret(secret_bytes, n, k) {
+  if !is_bytes(secret_bytes) {
+    raise Exception('split_secret: secret_bytes must be bytes')
+  }
+
+  var secret_len = secret_bytes.length()
+  if secret_len == 0 {
+    raise Exception('split_secret: secret must not be empty')
+  }
+  if secret_len > 65535 {
+    raise Exception('split_secret: secret too long (max 65535 bytes)')
+  }
+
+  if !is_number(n) or !is_number(k) {
+    raise Exception('split_secret: n and k must be numbers')
+  }
+  if n < 2 or n > 255 {
+    raise Exception('split_secret: n must be between 2 and 255')
+  }
+  if k < 2 or k > n {
+    raise Exception('split_secret: k must be between 2 and n')
+  }
+
+  # y[s][pos] = share s's byte value at secret position `pos`.
+  var ys = []
+  iter var s = 0; s < n; s++ {
+    var row = []
+    iter var p = 0; p < secret_len; p++ {
+      row.append(0)
+    }
+    ys.append(row)
+  }
+
+  iter var pos = 0; pos < secret_len; pos++ {
+    # Independent random polynomial per byte position:
+    #   f_pos(x) = secret_byte + a_1*x + a_2*x^2 + ... + a_{k-1}*x^{k-1}
+    var coeffs = [secret_bytes[pos]]
+    var rnd = crypto.random_bytes(k - 1)
+    iter var c = 0; c < k - 1; c++ {
+      coeffs.append(rnd[c])
+    }
+
+    iter var s = 0; s < n; s++ {
+      var x = s + 1   # x coordinates are 1..n; 0 is reserved for the secret itself
+      var y = 0
+      iter var c = coeffs.length() - 1; c >= 0; c-- {
+        y = _gf_mul(y, x) ^ coeffs[c]   # Horner's method, GF(256) arithmetic
+      }
+      ys[s][pos] = y
+    }
+  }
+
+  var shares = []
+  iter var s = 0; s < n; s++ {
+    shares.append(Share(s + 1, k, secret_len, bytes(ys[s])))
+  }
+
+  return shares
+}
+
+/**
+ * Reconstructs the original secret from a set of shares via Lagrange
+ * interpolation at x = 0, evaluated independently per byte position.
+ *
+ * Accepts a mix of `Share` objects and base58 strings.
+ *
+ * @param  list<string|Share> shares_in  at least `k` shares (k is read
+ *                                        from the shares themselves)
+ * @return bytes
+ * @throws Exception if shares disagree with each other, are duplicated,
+ *                    are malformed, or there simply aren't enough of them
+ */
+def combine_shares(shares_in: list) {
+  if shares_in.length() < 2 {
+    raise Exception('combine_shares: need at least 2 shares')
+  }
+
+  var shares = []
+  for item in shares_in {
+    shares.append(decode_share(item))
+  }
+
+  var k          = shares[0].threshold
+  var secret_len = shares[0].secret_len
+
+  var seen_x = {}
+  for sh in shares {
+    if sh.threshold != k {
+      raise Exception('combine_shares: shares disagree on threshold')
+    }
+    if sh.secret_len != secret_len {
+      raise Exception('combine_shares: shares disagree on secret length')
+    }
+    if seen_x.contains(sh.x) {
+      raise Exception(
+        'combine_shares: duplicate share (x=${sh.x}) in input — refusing to combine'
+      )
+    }
+    seen_x[sh.x] = true
+  }
+
+  if shares.length() < k {
+    raise Exception(
+      'combine_shares: this secret needs ${k} shares to recover, only ' +
+      '${shares.length()} were provided'
+    )
+  }
+
+  # Any k valid, agreeing shares are equivalent by construction — using
+  # exactly k keeps this from silently doing extra, pointless work if
+  # more were supplied.
+  var use = shares[,k]
+  var secret = [0] * secret_len
+
+  iter var pos = 0; pos < secret_len; pos++ {
+    var result = 0
+
+    iter var i = 0; i < use.length(); i++ {
+      var xi = use[i].x
+      var yi = use[i].y[pos]
+
+      # Lagrange basis polynomial L_i(0), in GF(256):
+      #   numerator   = product over j != i of (0 - x_j) = product of x_j
+      #     (since subtraction is XOR, and 0 XOR x_j = x_j)
+      #   denominator = product over j != i of (x_i - x_j) = (x_i XOR x_j)
+      var num = 1
+      var den = 1
+      iter var j = 0; j < use.length(); j++ {
+        if j == i {
+          continue
+        }
+        var xj = use[j].x
+        num = _gf_mul(num, xj)
+        den = _gf_mul(den, xi ^ xj)
+      }
+
+      result = result ^ _gf_mul(yi, _gf_div(num, den))
+    }
+
+    secret[pos] = result
+  }
+
+  return bytes(secret)
+}
+
+
+# ---------------------------------------------------------------------------
+# High-level vault API
+# ---------------------------------------------------------------------------
+
+/**
+ * Splits a secret and returns ready-to-distribute base58 share strings,
+ * plus a SHA-256 fingerprint of the original secret.
+ *
+ * The fingerprint is safe to store in the vault's own database (it does
+ * not let you recover the secret), and lets `recover_secret` detect a
+ * bad recovery — wrong shares, too few distinct custodians colluding by
+ * mistake, a corrupted share that nonetheless passed its own checksum
+ * check, etc. — instead of silently returning garbage.
+ *
+ * Before returning, this performs an internal round-trip self-check:
+ * it recombines the first `k` generated shares and verifies they
+ * reproduce the secret exactly. This is the single highest-value safety
+ * net in a vault context — it turns a hypothetical implementation bug
+ * into an exception at generation time instead of a silent failure
+ * discovered during a real, possibly urgent, recovery.
+ *
+ * @param  bytes  secret_bytes
+ * @param  number n  total shares, 2-255
+ * @param  number k  threshold to recover, 2-n
+ * @return dict {
+ *   shares:      list<string>  n base58-encoded shares
+ *   fingerprint: string        hex sha256(secret_bytes) — store this
+ *   threshold:   number
+ *   total:       number
+ * }
+ * @throws Exception on invalid arguments, or if the self-check fails
+ */
+def generate_shares(secret_bytes: bytes, n: number, k: ?number) {
+  if k == nil {
+    k = (n // 2) + 1
+  }
+
+  var shares = split_secret(secret_bytes, n, k)
+
+  var encoded = []
+  for sh in shares {
+    encoded.append(sh.to_string())
+  }
+
+  var check_set = encoded[,k]
+
+  var rebuilt = combine_shares(check_set)
+
+  if !_ct_eq(rebuilt, secret_bytes) {
+    raise Exception(
+      'generate_shares: internal self-check failed — the generated ' +
+      'shares do not reconstruct the original secret. Refusing to ' +
+      'return them. This indicates a bug in shamir.zu itself, not bad input.'
+    )
+  }
+
+  return {
+    shares:      encoded,
+    fingerprint: hash.sha256(secret_bytes),
+    threshold:   k,
+    total:       n,
+  }
+}
+
+/**
+ * Recovers a secret from a set of shares, optionally verifying the
+ * result against a fingerprint returned by `generate_shares`.
+ *
+ * Passing `expected_fingerprint` is strongly recommended in a vault
+ * service: without it, supplying the wrong shares (or too few unique
+ * custodians, or a corrupted-but-checksum-valid share) produces a
+ * *plausible-looking but wrong* secret rather than an error — that's
+ * inherent to how Lagrange interpolation works, not a bug.
+ *
+ * @param  list<string|Share> shares
+ * @param  ?string            expected_fingerprint  hex sha256, optional
+ * @return bytes
+ * @throws Exception if recovery fails structurally, or if the
+ *                    recovered secret doesn't match expected_fingerprint
+ */
+def recover_secret(shares, expected_fingerprint) {
+  var secret = combine_shares(shares)
+
+  if expected_fingerprint != nil {
+    var actual = hash.sha256(secret)
+    if actual != expected_fingerprint {
+      raise Exception(
+        'recover_secret: recovered secret does not match the expected ' +
+        'fingerprint. This almost always means the wrong shares (or too ' +
+        'few distinct ones) were supplied — refusing to return it.'
+      )
+    }
+  }
+
+  return secret
+}
+
+
+# ---------------------------------------------------------------------------
+# Enterprise extensions
+# ---------------------------------------------------------------------------
+
+/**
+ * Re-shares an existing secret under new (n, k) parameters without
+ * ever persisting the secret itself — recovers in memory, immediately
+ * re-splits, and returns fresh shares. Use this for periodic share
+ * rotation or changing your custodian count/threshold.
+ *
+ * The old shares should be revoked/destroyed by your operational
+ * process after this succeeds; this function has no way to do that for
+ * you since it doesn't know where the old shares live.
+ *
+ * @param  list<string|Share> old_shares
+ * @param  ?string            expected_fingerprint  of the existing secret
+ * @param  number             new_n
+ * @param  number             new_k
+ * @return dict  same shape as `generate_shares`
+ */
+def rotate_shares(old_shares, expected_fingerprint, new_n, new_k) {
+  var secret = recover_secret(old_shares, expected_fingerprint)
+  return generate_shares(secret, new_n, new_k)
+}
+
+/**
+ * Encrypts an encoded share string for storage in the vault's own
+ * database, using AES-256-GCM under a master key the vault controls.
+ *
+ * SECURITY NOTE: this is a convenience for a vault that needs to keep
+ * a *recovery copy* of shares it does not actually distribute out to
+ * independent custodians (e.g. an encrypted backup of a share that was
+ * also handed to a human). Encrypting every share under one master key
+ * collapses Shamir's threshold property back down to "whoever has the
+ * master key" for those copies — it is not a substitute for actually
+ * distributing shares to independent parties/HSMs. Use deliberately.
+ *
+ * @param  string share_string  output of `Share.to_string()`
+ * @param  bytes  master_key    16, 24, or 32 bytes
+ * @return string                base58(iv || ciphertext_with_tag)
+ */
+def encrypt_share_at_rest(share_string, master_key) {
+  var iv = crypto.random_bytes(12)
+  var ct = crypto.aes_gcm.encrypt(master_key, iv, share_string.to_bytes())
+  return base58.encode(iv + ct)
+}
+
+/**
+ * Inverse of `encrypt_share_at_rest`.
+ *
+ * @param  string encoded     output of `encrypt_share_at_rest`
+ * @param  bytes  master_key  the same key used to encrypt
+ * @return string             the original base58 share string
+ * @throws CryptoException if authentication fails (wrong key or
+ *                          tampered ciphertext)
+ */
+def decrypt_share_at_rest(encoded, master_key) {
+  var raw = base58.decode(encoded)
+  if raw.length() < 12 {
+    raise Exception('decrypt_share_at_rest: malformed input (too short)')
+  }
+  
+  var iv = raw[,12]
+  var ct = raw[12,]
+  var pt = crypto.aes_gcm.decrypt(master_key, iv, ct)
+  return pt.to_string()
+}
+
+
+# CLI Test
+if __root__ == __file__ {
+  import convert
+
+  var secret = crypto.random_bytes(32)   # e.g. a vault master key
+  echo 'Secret:'
+  echo '-------------------------'
+  echo convert.bytes_to_hex(secret)
+
+  var result = generate_shares(secret, 5, 3)   # 5 shares, need 3
+
+  echo '\nShares:'
+  echo '-------------------------'
+  echo result.shares       # ->5 base58 strings, hand one to each custodian
+
+  echo '\nFingerprint:'
+  echo '-------------------------'
+  echo result.fingerprint  # -> hex sha256(secret); store this, NOT the secret
+
+  # ... later, with any 3 of the 5 shares ...
+  var recovered = recover_secret(result.shares[,3], result.fingerprint)
+  echo '\nRecovered using first three shares:'
+  echo '-----------------------------------------'
+  echo convert.bytes_to_hex(recovered)
+
+  recovered = recover_secret(result.shares[2,], result.fingerprint)
+  echo '\nRecovered using last three shares:'
+  echo '-----------------------------------------'
+  echo convert.bytes_to_hex(recovered)
+}

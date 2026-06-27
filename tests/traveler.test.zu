@@ -1,0 +1,64 @@
+import ..app.config.traveler { * }
+
+test('Traveler', @{
+  it('should fetch nested value', @{
+    var config = ConfigTraveler({
+      api: {
+        url: 'http://localhost:8080',
+      },
+    })
+    
+    expect(config.get('api.url')).to_be('http://localhost:8080')
+  })
+
+  it('should fetch nested value from original when missing in user config', @{
+    var config = ConfigTraveler(
+      {
+        api: {
+          url: 'http://localhost:8080',
+        },
+      },
+      {
+        api: {
+          port: 3000,
+        }
+      }
+    )
+
+    expect(config.get('api.port')).to_be(3000)
+  })
+
+  it('should return nil when missing in both user config and original', @{
+    var config = ConfigTraveler(
+      {
+        api: {
+          url: 'http://localhost:8080',
+        },
+      },
+      {
+        api: {
+          port: 3000,
+        }
+      }
+    )
+
+    expect(config.get('api.address')).to_be_nil()
+  })
+
+  it('should return default value when missing in both user config and original and default value is set', @{
+    var config = ConfigTraveler(
+      {
+        api: {
+          url: 'http://localhost:8080',
+        },
+      },
+      {
+        api: {
+          port: 3000,
+        }
+      }
+    )
+
+    expect(config.get('api.address', '4400')).to_be('4400')
+  })
+})

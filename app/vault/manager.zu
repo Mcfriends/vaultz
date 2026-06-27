@@ -1,0 +1,361 @@
+/**
+ * The vault manager manages administration and security of the vault.
+ * 
+ * It handles the creation of root keys, which are used to encrypt
+ * and decrypt secret data.
+ * 
+ * It also manages the lifetime of the various encryption keys used in the vault.
+ */
+
+import crypto
+import bcrypt
+import os
+
+import .keypair
+import .shamir
+import .base58
+import .error
+
+
+# Private copy of the working key in memory
+var _master_key = nil
+
+# Our private copy of answers to challenges in progress.
+# Doing this will save us lots of filesystem lookup.
+var _challenge_answers = {}
+
+
+def _load_kek(password: string) {
+  # Derive master key:
+  # 
+  # Pass the password through Argon2id with a random salt to generate a 
+  # 256-bit Key Encryption Key (KEK).
+  var salt = crypto.random_bytes(16)
+  var key = crypto.argon2.hash(password, salt, nil, true)
+
+  return { salt, key }
+}
+
+def _set_master_key(master_key_base58: string, master_key_bytes: bytes) {
+  _master_key = {
+    string: master_key_base58,
+    bytes: master_key_bytes,
+    public_key: keypair.public_key_from_private_key(master_key_bytes, true)
+  }
+}
+
+def _clear_master_key() {
+  if _master_key {
+    _master_key.bytes.dispose()
+  }
+
+  # Unset it
+  _master_key = nil
+}
+
+def _authorize(key: ?string) {
+  if _master_key == nil {
+    raise error.VaultSealed
+  }
+
+  if !key or !verify_auth_key('$2a$05$' + key) {
+    raise error.Unauthorized
+  }
+}
+
+
+/**
+ * Creates the root keys for the vault.
+ * 
+ * Everything in the vault will be exposed directly via API and will be accessible 
+ * remotely, EXCEPT this function. This function will only be accessible from the 
+ * same machine that it is called on, and will require a challenge to be verified.
+ * 
+ * To initiate this function, you must retrieve a challenge from get_init_challenge()
+ * first, then pass the answer to that challenge when calling this function.
+ */
+def new_root_keys(question: string, answer: string) {
+  if _master_key != nil {
+    raise error.VaultInitialized
+  }
+
+  # Validate the challenge
+  if !validate_init_challenge(question, answer) {
+    raise error.Challenge
+  }
+
+  # We must ensure that the manager is in a sealed state before we generate new keys.
+  seal()
+
+  # Working Key in memory
+  var master_root_key = keypair.generate()
+  
+  # For custodians
+  var shares = shamir.generate_shares(
+    master_root_key.private_key_bytes, config.security.root_key.shares, config.security.root_key.threshold
+  )
+  
+  # For user authentication
+  var auth_key = bcrypt.hash(master_root_key.address, 5)[7,]
+
+  # Update working key
+  _set_master_key(master_root_key.private_key_base58, master_root_key.private_key_bytes)
+
+  return {
+    auth_key: auth_key,
+    shares: shares.shares,
+    fingerprint: shares.fingerprint,
+  }
+}
+
+/**
+ * The init challenge requires that users verify that they have access to the machine on 
+ * which Vaultz runs and that they have sufficient rights to be able to traverse the system. 
+ * This is the minimum verification to ensure that the caller is indeed a sysadmin.
+ * 
+ * ----------------------------------------------------------------------------------------
+ * The challenge itself is simple, yet effective.
+ * ----------------------------------------------------------------------------------------
+ * 
+ * Vaultz creates a random file with a cryptographically secure name random name in the data 
+ * directory and populates it with cryptographically secure random data. It returns the data 
+ * that was created to the caller who will in turn try to locate the file which contains that 
+ * data. 
+ * 
+ * To pass the challenge, the user must return the file name. This shows that they have 
+ * sufficient rights to use the system, access directories, list files, open files and read 
+ * them.
+ */
+def get_init_challenge() {
+  # Create a 2kB data. More difficult to brute-force a guess.
+  var data = crypto.random_bytes(2048)
+
+  var filename = base58.encode(crypto.random_bytes(64))
+
+  if !os.dir_exists(config.path.challenge_dir) {
+    os.create_dir(config.path.challenge_dir)
+  }
+
+  # Here's an interesting security tidbit. Everytime you generate a new challenge, it becomes 
+  # increasingly difficult for attackers to brute-force the filename.
+  if !file(os.join_paths(config.path.challenge_dir, filename), 'wb').write(data) {
+    raise error.Challenge
+  }
+
+  var question = base58.encode(data)
+
+  # Keep a record of the question and answer
+  _challenge_answers[question] = filename
+
+  # Return the base58 encoded data
+  return question
+}
+
+/**
+ * Validates the answer to the init challenge.
+ */
+def validate_init_challenge(question: string, answer: string) {
+  if !_challenge_answers.contains(question) {
+    raise error.Challenge
+  }
+
+  var passed = _challenge_answers[question] == answer 
+
+  # This challenge is use up. We need to remove it from the record whether 
+  # it passed or not.
+  # 
+  # Remember, only remove the record in memory not the actual file because 
+  # keeping the actual file is part of the challenge. We cannot stop users 
+  # from deleting the files from the filesystem themselves, but the hardness 
+  # of the challenge simply resets to the status of a new installation 
+  # which is still pretty secure too. (TODO: Find a soltion to this!)
+  _challenge_answers.remove(question)
+
+  if !passed {
+    raise error.Challenge
+  }
+
+  return true
+}
+
+/**
+ * Replaces the root keys for the vault.
+ */
+def replace_root_keys(shares: list, fingerprint: ?string) {
+  if _master_key == nil {
+    raise error.VaultSealed
+  }
+
+  # Recover the old shares first
+  var secret = shamir.recover_secret(shares, fingerprint)
+  var secret_base58 = base58.encode(secret)
+
+  # Verify that the user has the correct secret for the master key
+  if secret_base58 != _master_key.string {
+    raise error.InvalidSecret
+  }
+
+  seal()
+  
+  # For custodians
+  shares = shamir.generate_shares(
+    secret, config.security.root_key.shares, config.security.root_key.threshold
+  )
+  
+  # For user authentication
+  var auth_key = bcrypt.hash(
+    keypair.public_key_from_private_key(secret, true), 
+    5
+  )[7,]
+  
+  # Update working key
+  _set_master_key(secret_base58, secret)
+
+  return {
+    auth_key: auth_key,
+    shares: shares.shares,
+    fingerprint: shares.fingerprint,
+  }
+}
+
+/**
+ * Seals the root keys, removing them from memory.
+ */
+def seal() {
+  _clear_master_key()
+}
+
+/**
+ * Unseals the root keys from the shares.
+ */
+def unseal(shares: list, fingerprint: ?string) {
+  var secret = shamir.recover_secret(shares, fingerprint)
+  var secret_base58 = base58.encode(secret)
+  
+  # Update working key
+  _set_master_key(secret_base58, secret)
+}
+
+/**
+ * Unseals the root keys from the shares.
+ */
+def refresh_auth_key() {
+  if _master_key == nil {
+    raise error.VaultSealed
+  }
+
+  # For user authentication
+  return bcrypt.hash(_master_key.public_key, 5)[7,]
+}
+
+/**
+ * Verifies the auth key given by a user.
+ */
+def verify_auth_key(key: string) {
+  if _master_key == nil {
+    raise error.VaultSealed
+  }
+  
+  return bcrypt.compare(_master_key.public_key, key)
+}
+
+def encrypt(data: string|bytes, authority: ?string) {
+  _authorize(authority)
+
+  if is_string(data) {
+    data = data.to_bytes()
+  }
+
+  # Derive master key:
+  # 
+  # Pass the password through Argon2id with a random salt to generate a 
+  # 256-bit Key Encryption Key (KEK).
+  var kek_salt = crypto.random_bytes(16)
+  var kek = crypto.argon2.hash(_master_key.string, kek_salt, nil, true)
+
+  # Generate Ephemeral DEK:
+  # 
+  # Generate a cryptographically secure random 256-bit Data Encryption Key (DEK).
+  var dek = crypto.random_bytes(32)
+  
+  # Encrypt Data: 
+  # 
+  # Use ChaCha20-Poly1305 with the DEK to encrypt the vault text.
+  var data_encryption_iv = crypto.random_bytes(12)
+  var encrypted_data = crypto.chacha20.encrypt(dek, data_encryption_iv, data)
+
+  # Wrap Key: 
+  # 
+  # Use ChaCha20-Poly1305 with the KEK to encrypt the DEK.
+  var key_encryption_iv = crypto.random_bytes(12)
+  var encrypted_dek = crypto.chacha20.encrypt(kek, key_encryption_iv, dek)
+
+  var output =  kek_salt +
+                key_encryption_iv +
+                encrypted_dek +
+                data_encryption_iv +
+                encrypted_data
+
+  return output
+}
+
+def decrypt(secret: string|bytes, authority: ?string) {
+  _authorize(authority)
+
+  if is_string(secret) {
+    secret = secret.to_bytes()
+  }
+
+  if secret.length() < 88 {
+    raise error.InvalidSecret
+  }
+
+  var kek_salt = secret[0,16]
+  var key_encryption_iv = secret[16, 28]
+  var encrypted_dek = secret[28, 76]
+  var data_encryption_iv = secret[76, 88]
+  var encrypted_data = secret[88,]
+
+  # Decode Key Encryption Key (KEK)
+  var kek = crypto.argon2.hash(_master_key.string, kek_salt, nil, true)
+
+  # Unwrap the Data Encryption Key (DEK) using the KEK
+  # 
+  # Because ChaCha20-Poly1305 is an AEAD cipher, it automatically validates 
+  # the internal MAC (Message Authentication Code) tag. If the password was 
+  # wrong, or if someone tampered with the file, the decryption will fail 
+  # right here.
+  var dek = crypto.chacha20.decrypt(kek, key_encryption_iv, encrypted_dek)
+
+  # Decrypt the Raw Secrets
+  return crypto.chacha20.decrypt(dek, data_encryption_iv, encrypted_data)
+}
+
+
+# CLI Test
+if __root__ == __file__ {
+
+  # We're importing all to ensure that the module 'config' does not conflict 
+  # with the global 'config'.
+  import ..config { * }
+
+  # Set up challenge
+  var question = get_init_challenge()
+
+  # Generate root keys
+  # 
+  # For our simple test, let's just lookup the answer to the challenge instead 
+  # of solving it by resolving files.
+  var root_keys = new_root_keys(question, _challenge_answers[question])
+  unseal(root_keys.shares[,3])
+
+  var secure_data = encrypt('hello world who is in the gaddamn garden!', root_keys.auth_key)
+
+  echo 'Decrypted under old master key:'
+  echo decrypt(secure_data, root_keys.auth_key).to_string()
+
+  var new_root_keys = replace_root_keys(root_keys.shares[2,])
+
+  echo 'Keys have been replaced, decrypted under new key:'
+  echo decrypt(secure_data, new_root_keys.auth_key).to_string()
+}

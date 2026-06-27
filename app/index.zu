@@ -1,0 +1,26 @@
+import thread
+
+# Import config once here to ensure that config is loaded and 
+# globally available to all modules loaded via the application 
+# entry point.
+# 
+# Must be the first to be imported so as to avoid side effects
+# from other modules.
+import .config
+
+# Must be next to be imported after config to avoid side effects
+# from other modules.
+import .logging
+
+import .api
+import .ui
+
+# Import vault manager here to ensure that only a single instance of 
+# the vault manager runs throughout the lifetime of the application 
+# and is visible to all running threads.
+import .vault.manager
+
+thread.await_all(
+  thread.start(api.run_server),
+  thread.start(ui.run_server)
+)

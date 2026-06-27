@@ -1,0 +1,17 @@
+api:
+  port: 3000
+  secure: false
+
+ui:
+  port: 4000
+  secure: false
+
+security:
+  root_key:
+    shares: 5
+    threshold: 3
+  secure_wipe: true
+
+storage:
+  type: file
+  path: ./vault

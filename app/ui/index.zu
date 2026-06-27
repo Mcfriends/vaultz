@@ -1,0 +1,15 @@
+import http
+import log
+
+def run_server() {
+  var port = to_number(config.ui.port)
+  
+  var server = http.server(port)
+  
+  server.handle('GET', '/', @(req, res) {
+    res.write('Hello, World from UI server!')
+  })
+
+  log.info('Starting UI server on port ${port}...')
+  server.listen()
+}

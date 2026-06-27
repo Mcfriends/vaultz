@@ -1,0 +1,10 @@
+import .controller
+
+def routes(server) {
+  server.handle('POST', '/init', controller.init)
+  server.handle('POST', '/seal', controller.seal)
+  server.handle('POST', '/unseal', controller.unseal)
+  server.handle('POST', '/login', controller.login)
+  server.handle('POST', '/add', controller.add)
+  server.handle('POST', '/get', controller.get)
+}

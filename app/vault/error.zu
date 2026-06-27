@@ -1,0 +1,37 @@
+class VaultSealedError < Exception {
+  VaultSealedError() {
+    parent('Vault is sealed')
+  }
+}
+
+class InvalidSecretError < Exception {
+  InvalidSecretError() {
+    parent('Invalid vault secret')
+  }
+}
+
+class UnauthorizedError < Exception {
+  UnauthorizedError() {
+    parent('Unauthorized')
+  }
+}
+
+class VaultInitializedError < Exception {
+  VaultInitializedError() {
+    parent('Vault is already initialized')
+  }
+}
+
+class ChallengeError < Exception {
+  ChallengeError() {
+    parent('Challenge error')
+  }
+}
+
+
+# Exported constants
+var VaultSealed = VaultSealedError()
+var InvalidSecret = InvalidSecretError()
+var Unauthorized = UnauthorizedError()
+var VaultInitialized = VaultInitializedError()
+var Challenge = ChallengeError()

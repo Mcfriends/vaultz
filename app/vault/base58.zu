@@ -1,0 +1,129 @@
+/**
+ * Base58 (Vaultz alphabet) encoder fully compartible with Solana 
+ * and Bitcoin address and keys.
+ */
+
+import bigint
+import convert
+
+
+var _B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+# Reverse lookup (char → digit value) for base58_decode, built once.
+var _B58_INDEX = {}
+iter var _i = 0; _i < _B58_ALPHABET.length(); _i++ {
+  _B58_INDEX[_B58_ALPHABET[_i]] = _i
+}
+
+/**
+ * Encodes raw bytes as a base58 string, using arbitrary-precision
+ * arithmetic from the `bigint` module.
+ *
+ * This is a plain deterministic text encoding (the same algorithm used
+ * by Bitcoin addresses and Solana addresses/secret keys) — it carries
+ * no secrecy or authentication property of its own, so implementing it
+ * directly (rather than shelling out) is fine.
+ *
+ * @param  bytes  data
+ * @return string
+ */
+def encode(data) {
+  var len = data.length()
+  if len == 0 {
+    return ''
+  }
+
+  # Every leading 0x00 byte becomes a leading '1' in the base58 string —
+  # this is the standard base58 convention (preserves byte length info
+  # that would otherwise be lost since leading zeros vanish numerically).
+  var zeros = 0
+  while zeros < len and data[zeros] == 0 {
+    zeros++
+  }
+
+  # Build the big integer from the hex representation of the bytes.
+  # (bigint's array/endian constructor path is not wired up in the
+  # version you shared, so we go through hex, which is fully supported.)
+  var n = bigint(convert.bytes_to_hex(data), 16)
+
+  var digits = []
+  while !n.isZero() {
+    var rem = (n % 58).toNumber()
+    digits.append(_B58_ALPHABET[rem])
+    n = n // 58
+  }
+
+  var out = ''
+  iter var i = 0; i < zeros; i++ {
+    out += '1'
+  }
+
+  if digits.is_empty() {
+    return out   # data was entirely zero bytes
+  }
+
+  iter var i = digits.length() - 1; i >= 0; i-- {
+    out += digits[i]
+  }
+
+  return out
+}
+
+/**
+ * Decodes a base58 string (the Bitcoin/Solana alphabet) back into raw
+ * bytes. Inverse of `base58.encode`.
+ *
+ * Use this to turn a Solana address or a base58 secret key a user gives
+ * you back into raw bytes — e.g. before feeding the 32-byte result into
+ * `crypto.ed25519.verify`, or the 64-byte secret key into
+ * `public_key_from_secret_key` below.
+ *
+ * @param  string str
+ * @return bytes
+ * @throws Exception on a character outside the base58 alphabet
+ */
+def decode(str) {
+  if str.length() == 0 {
+    return bytes(0)
+  }
+
+  # Leading '1' characters are leading 0x00 bytes — same convention as
+  # the encoder, in reverse.
+  var ones = 0
+  while ones < str.length() and str[ones] == '1' {
+    ones++
+  }
+
+  var n = bigint(0)
+
+  iter var i = ones; i < str.length(); i++ {
+    var ch = str[i]
+    if !_B58_INDEX.contains(ch) {
+      raise Exception('Invalid base58 character "${ch}" at position ${i}')
+    }
+    n = n * 58 + _B58_INDEX[ch]
+  }
+
+  # Convert n back to big-endian bytes via hex, pairing up hex digits
+  # into bytes using only indexing + concatenation (no slice syntax).
+  var hex = n.isZero() ? '' : n.toString(16)
+  if hex.length() % 2 != 0 {
+    hex = '0' + hex
+  }
+
+  var body = convert.hex_to_bytes(hex).to_list()
+  # iter var i = 0; i < hex.length(); i += 2 {
+  #   var pair = hex[i] + hex[i + 1]
+  #   body.append(convert.hex_to_bytes(pair)[0])
+  # }
+
+  var out = []
+  iter var i = 0; i < ones; i++ {
+    out.append(0)
+  }
+  for b in body {
+    out.append(b)
+  }
+
+  return bytes(out)
+}
