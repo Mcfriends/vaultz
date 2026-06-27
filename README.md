@@ -1,6 +1,6 @@
 # vaultz
 
-A highliy secure key-value storage for sensitive data, passwords, and tokens with UI, CLI, and JSON-RPC access.
+A highliy secure key-value storage for sensitive data, passwords, and tokens with UI, CLI, and API access.
 
 ### Package Information
 
@@ -10,4 +10,3 @@ A highliy secure key-value storage for sensitive data, passwords, and tokens wit
 - **Tags:** storage, key-value, database, security, token-management
 - **Author:** Richard Ore <eqliqandfriends@gmail.com>
 - **License:** MIT
-
